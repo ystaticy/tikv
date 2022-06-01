@@ -23,6 +23,7 @@ use grpcio::{CallOption, EnvBuilder, Environment, WriteFlags};
 use kvproto::{
     metapb,
     pdpb::{self, Member},
+    gcpb::{self,KeySpace,ListKeySpacesResponse},
     replication_modepb::{RegionReplicationStatus, ReplicationStatus, StoreDrAutoSyncStatus},
 };
 use security::SecurityManager;
@@ -37,7 +38,7 @@ use yatp::{task::future::TaskCell, ThreadPool};
 
 use super::{
     metrics::*,
-    util::{check_resp_header, sync_request, Client, PdConnector},
+    util::{check_resp_header,check_gc_resp_header, sync_request, Client, PdConnector},
     BucketStat, Config, Error, FeatureGate, PdClient, PdFuture, RegionInfo, RegionStat, Result,
     UnixSecs, REQUEST_TIMEOUT,
 };
@@ -49,6 +50,7 @@ pub struct RpcClient {
     cluster_id: u64,
     pd_client: Arc<Client>,
     monitor: Arc<ThreadPool<TaskCell>>,
+
 }
 
 impl RpcClient {
@@ -87,7 +89,7 @@ impl RpcClient {
         let pd_connector = PdConnector::new(env.clone(), security_mgr.clone());
         for i in 0..retries {
             match pd_connector.validate_endpoints(cfg).await {
-                Ok((client, target, members, tso)) => {
+                Ok((client,gc_client, target, members, tso)) => {
                     let cluster_id = members.get_header().get_cluster_id();
                     let rpc_client = RpcClient {
                         cluster_id,
@@ -95,6 +97,7 @@ impl RpcClient {
                             Arc::clone(&env),
                             security_mgr.clone(),
                             client,
+                            gc_client,
                             members,
                             target,
                             tso,
@@ -175,6 +178,13 @@ impl RpcClient {
     /// Creates a new request header.
     fn header(&self) -> pdpb::RequestHeader {
         let mut header = pdpb::RequestHeader::default();
+        header.set_cluster_id(self.cluster_id);
+        header
+    }
+
+    /// Creates a new request header.
+    fn gc_header(&self) -> gcpb::RequestHeader {
+        let mut header = gcpb::RequestHeader::default();
         header.set_cluster_id(self.cluster_id);
         header
     }
@@ -849,6 +859,39 @@ impl PdClient for RpcClient {
                     .observe(duration_to_sec(timer.saturating_elapsed()));
                 check_resp_header(resp.get_header())?;
                 Ok(resp.get_safe_point())
+            }) as PdFuture<_>
+        };
+
+        self.pd_client
+            .request(req, executor, LEADER_CHANGE_RETRY)
+            .execute()
+    }
+
+    fn get_gc_safe_point_by_keyspace(&self,withGCSafePoint :bool) -> PdFuture<ListKeySpacesResponse> {
+        info!("test get_gc_safe_point_by_keyspace");
+        let timer = Instant::now();
+
+        let mut req = gcpb::ListKeySpacesRequest::default();
+        req.set_header(self.gc_header());
+        req.set_with_gc_safe_point(withGCSafePoint);
+
+        let executor = move |client: &Client, req: gcpb::ListKeySpacesRequest| {
+            let option = Self::call_option(client);
+            let handler = client
+                .inner
+                .rl()
+                .gc_client_stub
+                .list_key_spaces_async_opt(&req, option)
+                .unwrap_or_else(|e| {
+                    panic!("fail to request PD {} err {:?}", "list_key_spaces_async_opt", e)
+                });
+            Box::pin(async move {
+                let resp = handler.await?;
+                PD_REQUEST_HISTOGRAM_VEC
+                    .with_label_values(&["list_key_spaces_async_opt"])
+                    .observe(duration_to_sec(timer.saturating_elapsed()));
+                check_gc_resp_header(resp.get_header())?;
+                Ok(resp)
             }) as PdFuture<_>
         };
 

@@ -3,10 +3,14 @@
 use std::{
     ffi::CString,
     mem,
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
 };
 
 use api_version::{ApiV2, KeyMode, KvFormat};
+use collections::HashMap;
 use engine_rocks::{
     raw::{
         new_compaction_filter_raw, CompactionFilter, CompactionFilterContext,
@@ -16,9 +20,13 @@ use engine_rocks::{
     RocksEngine,
 };
 use engine_traits::{raw_ttl::ttl_current_ts, MiscExt};
+use keys::DEFAULT_RAW_KEYSPACE;
 use prometheus::local::LocalHistogram;
 use raftstore::coprocessor::RegionInfoProvider;
-use tikv_util::worker::{ScheduleError, Scheduler};
+use tikv_util::{
+    worker::{ScheduleError, Scheduler},
+    HandyRwLock,
+};
 use txn_types::Key;
 
 use crate::{
@@ -54,18 +62,45 @@ impl CompactionFilterFactory for RawCompactionFilterFactory {
 
         let current = ttl_current_ts();
         let safe_point = gc_context.safe_point.load(Ordering::Relaxed);
-        if safe_point == 0 {
+
+        let enable_key_space = gc_context.cfg_tracker.value().enable_key_space;
+
+        if safe_point == 0 && !enable_key_space {
             // Safe point has not been initialized yet.
             debug!("skip gc in compaction filter because of no safe point");
             return std::ptr::null_mut();
         }
+
+        let keyspace_safepoint = Arc::clone(&gc_context.keyspace_safepoint);
+
+
+        //------------test---------------
+        let read_map = keyspace_safepoint.rl();
+        let keyspace_name="default_raw".to_string().into_bytes();
+        let get_safe_point = read_map.get(&keyspace_name);
+        match get_safe_point {
+            None => {
+                // This keyspace don't init safepoint
+                info!("filter check safepoint keyspace:none {:?}",keyspace_name);
+            }
+            Some(_safe_point) => {
+                let res=_safe_point.load(Ordering::Relaxed);
+                info!("filter check safepoint keyspace:ok {:?},{}",keyspace_name,res);
+            },
+        };
+
+        //------------test---------------
+
+
         let filter = RawCompactionFilter::new(
             db,
             safe_point,
+            Arc::clone(&keyspace_safepoint),
             gc_scheduler,
             current,
             context,
             (store_id, region_info_provider),
+            enable_key_space,
         );
         let name = CString::new("raw_compaction_filter").unwrap();
         unsafe { new_compaction_filter_raw(name, filter) }
@@ -74,6 +109,7 @@ impl CompactionFilterFactory for RawCompactionFilterFactory {
 
 struct RawCompactionFilter {
     safe_point: u64,
+    keyspace_safepoint: Arc<RwLock<HashMap<Vec<u8>, Arc<AtomicU64>>>>,
     engine: RocksEngine,
     gc_scheduler: Scheduler<GcTask<RocksEngine>>,
     current_ts: u64,
@@ -91,6 +127,7 @@ struct RawCompactionFilter {
     filtered_hist: LocalHistogram,
 
     encountered_errors: bool,
+    enable_key_space: bool,
 }
 
 thread_local! {
@@ -140,16 +177,22 @@ impl RawCompactionFilter {
     fn new(
         engine: RocksEngine,
         safe_point: u64,
+        keyspace_safepoint: Arc<RwLock<HashMap<Vec<u8>, Arc<AtomicU64>>>>,
         gc_scheduler: Scheduler<GcTask<RocksEngine>>,
         ts: u64,
         _context: &CompactionFilterContext,
         regions_provider: (u64, Arc<dyn RegionInfoProvider>),
+        enable_key_space: bool,
     ) -> Self {
         // Safe point must have been initialized.
-        assert!(safe_point > 0);
+        if !enable_key_space {
+            assert!(safe_point > 0);
+        }
+
         debug!("gc in compaction filter"; "safe_point" => safe_point);
         RawCompactionFilter {
             safe_point,
+            keyspace_safepoint,
             engine,
             gc_scheduler,
             current_ts: ts,
@@ -166,6 +209,8 @@ impl RawCompactionFilter {
             filtered_hist: GC_DELETE_VERSIONS_HISTOGRAM.local(),
 
             encountered_errors: false,
+
+            enable_key_space,
         }
     }
 
@@ -189,11 +234,31 @@ impl RawCompactionFilter {
 
         let (mvcc_key_prefix, commit_ts) = ApiV2::split_ts(key)?;
 
+        let current_safe_point;
+        if self.enable_key_space {
+            // TODO: parse key_space
+            let key_space = DEFAULT_RAW_KEYSPACE.to_string().into_bytes();
+            let read_map = self.keyspace_safepoint.rl();
+            let safe_point = read_map.get(&key_space);
+            match safe_point {
+                None => {
+                    // This keyspace don't init safepoint
+                    info!("test do_filter safe_point none!!!");
+                    return Ok(CompactionFilterDecision::Keep);
+                }
+                Some(_safe_point) => {
+                    current_safe_point = _safe_point.load(Ordering::Relaxed);
+                }
+            }
+        } else {
+            current_safe_point = self.safe_point;
+        }
+
         if self.mvcc_key_prefix != mvcc_key_prefix {
             self.switch_key_metrics();
             self.mvcc_key_prefix.clear();
             self.mvcc_key_prefix.extend_from_slice(mvcc_key_prefix);
-            if commit_ts.into_inner() >= self.safe_point {
+            if commit_ts.into_inner() >= current_safe_point {
                 return Ok(CompactionFilterDecision::Keep);
             }
 
@@ -210,7 +275,7 @@ impl RawCompactionFilter {
             // 2. If it's the latest version, and it's deleted or expired, while we do async gctask to deleted or expired records, both put records and deleted/expired records are actually kept within the compaction filter.
             Ok(CompactionFilterDecision::Keep)
         } else {
-            if commit_ts.into_inner() >= self.safe_point {
+            if commit_ts.into_inner() >= current_safe_point {
                 return Ok(CompactionFilterDecision::Keep);
             }
 
@@ -319,6 +384,11 @@ pub mod tests {
 
     #[test]
     fn test_raw_compaction_filter() {
+        test_raw_compaction_filter_impl(false);
+        test_raw_compaction_filter_impl(true);
+    }
+
+    fn test_raw_compaction_filter_impl(is_key_space: bool) {
         let mut cfg = DbConfig::default();
         cfg.defaultcf.disable_auto_compactions = true;
         cfg.defaultcf.dynamic_level_bytes = false;
@@ -361,7 +431,16 @@ pub mod tests {
 
         engine.write(&ctx, batch).unwrap();
 
-        gc_runner.safe_point(80).gc_raw(&raw_engine);
+        let mut safe_point = 80;
+
+        if is_key_space {
+            gc_runner
+                .set_keyspace_safe_point(DEFAULT_RAW_KEYSPACE.to_string().into_bytes(), safe_point);
+            gc_runner.getleng();
+            gc_runner.gc_raw(&raw_engine, true);
+        } else {
+            gc_runner.safe_point(safe_point).gc_raw(&raw_engine, false);
+        }
 
         // If ts(70) < safepoint(80), and this userkey's latest verion is not deleted or expired, this version will be removed in do_filter.
         let entry70 = raw_engine
@@ -369,7 +448,15 @@ pub mod tests {
             .unwrap();
         assert!(entry70.is_none());
 
-        gc_runner.safe_point(90).gc_raw(&raw_engine);
+        safe_point = 90;
+        if is_key_space {
+            gc_runner
+                .set_keyspace_safe_point(DEFAULT_RAW_KEYSPACE.to_string().into_bytes(), safe_point);
+            gc_runner.getleng();
+            gc_runner.gc_raw(&raw_engine, true);
+        } else {
+            gc_runner.safe_point(safe_point).gc_raw(&raw_engine, false);
+        }
 
         let entry100 = raw_engine
             .get_value_cf(CF_DEFAULT, make_key(user_key, 100).as_slice())
@@ -387,6 +474,11 @@ pub mod tests {
 
     #[test]
     fn test_raw_call_gctask() {
+        test_raw_call_gctask_impl(false);
+        test_raw_call_gctask_impl(true);
+    }
+
+    fn test_raw_call_gctask_impl(is_key_space: bool) {
         let engine = TestEngineBuilder::new()
             .api_version(ApiVersion::V2)
             .build()
@@ -395,7 +487,17 @@ pub mod tests {
         let mut gc_runner = TestGCRunner::new(0);
 
         let mut gc_and_check = |expect_tasks: bool, prefix: &[u8]| {
-            gc_runner.safe_point(500).gc_raw(&raw_engine);
+            let safe_point = 500;
+            if is_key_space {
+                gc_runner.set_keyspace_safe_point(
+                    DEFAULT_RAW_KEYSPACE.to_string().into_bytes(),
+                    safe_point,
+                );
+                gc_runner.getleng();
+                gc_runner.gc_raw(&raw_engine, true);
+            } else {
+                gc_runner.safe_point(safe_point).gc_raw(&raw_engine, false);
+            }
 
             // Wait up to 1 second, and treat as no task if timeout.
             if let Ok(Some(task)) = gc_runner.gc_receiver.recv_timeout(Duration::new(1, 0)) {
@@ -456,7 +558,6 @@ pub mod tests {
         let check_key_del = make_key(user_key_del, 1);
         let (prefix_del, _commit_ts) = ApiV2::split_ts(check_key_del.as_slice()).unwrap();
         gc_and_check(true, prefix_del);
-
         // Clean the engine, prepare for later tests.
         let range_start_key =
             keys::data_key(ApiV2::encode_raw_key(user_key_del, None).as_encoded());

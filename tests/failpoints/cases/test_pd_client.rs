@@ -70,6 +70,7 @@ fn test_pd_client_deadlock() {
         request!(client => block_on(report_batch_split(vec![]))),
         request!(client => scatter_region(RegionInfo::new(Region::default(), None))),
         request!(client => block_on(get_gc_safe_point())),
+        request!(client => block_on(get_gc_safe_point_by_keyspace())),
         request!(client => block_on(get_store_stats_async(0))),
         request!(client => get_operator(0)),
         request!(client => block_on(get_tso())),

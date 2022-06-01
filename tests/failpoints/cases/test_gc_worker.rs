@@ -399,6 +399,10 @@ fn init_compaction_filter(cluster: &Cluster<ServerCluster>, store_id: u64) {
         fn get_safe_point(&self) -> GcWorkerResult<TimeStamp> {
             Ok(TimeStamp::from(0))
         }
+
+        fn get_rawkv_safe_point(&self) -> GcWorkerResult<TimeStamp> {
+            Ok(TimeStamp::from(0))
+        }
     }
 
     #[derive(Clone)]

@@ -4,16 +4,19 @@ use std::{
     cmp::Ordering,
     sync::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
-        mpsc, Arc,
+        mpsc, Arc, RwLock,
     },
     thread::{self, Builder as ThreadBuilder, JoinHandle},
     time::Duration,
 };
+use std::ops::Deref;
 
+use collections::HashMap;
 use engine_traits::KvEngine;
+use keys::DEFAULT_TXN_KEYSPACE;
 use pd_client::FeatureGate;
 use raftstore::{coprocessor::RegionInfoProvider, store::util::find_peer};
-use tikv_util::{time::Instant, worker::Scheduler};
+use tikv_util::{HandyRwLock, time::Instant, worker::Scheduler};
 use txn_types::{Key, TimeStamp};
 
 use super::{
@@ -237,12 +240,15 @@ pub(super) struct GcManager<S: GcSafePointProvider, R: RegionInfoProvider, E: Kv
 
     cfg_tracker: GcWorkerConfigManager,
     feature_gate: FeatureGate,
+    service_group: String,
+    keyspace_safepoint: Arc<RwLock<HashMap<Vec<u8>, Arc<AtomicU64>>>>,
 }
 
 impl<S: GcSafePointProvider, R: RegionInfoProvider + 'static, E: KvEngine> GcManager<S, R, E> {
     pub fn new(
         cfg: AutoGcConfig<S, R>,
         safe_point: Arc<AtomicU64>,
+        keyspace_safepoint: Arc<RwLock<HashMap<Vec<u8>, Arc<AtomicU64>>>>,
         worker_scheduler: Scheduler<GcTask<E>>,
         cfg_tracker: GcWorkerConfigManager,
         feature_gate: FeatureGate,
@@ -255,6 +261,8 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider + 'static, E: KvEngine> GcMan
             gc_manager_ctx: GcManagerContext::new(),
             cfg_tracker,
             feature_gate,
+            service_group: "".to_string(),
+            keyspace_safepoint,
         }
     }
 
@@ -266,6 +274,31 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider + 'static, E: KvEngine> GcMan
     fn save_safe_point(&self, ts: TimeStamp) {
         self.safe_point
             .store(ts.into_inner(), AtomicOrdering::Relaxed);
+    }
+
+    fn curr_all_safe_point_by_keyspace(&self) -> Arc<RwLock<HashMap<Vec<u8>, Arc<AtomicU64>>>> {
+        self.keyspace_safepoint.clone()
+    }
+
+    fn save_safe_point_by_keyspace(&self, keyspace: Vec<u8>, ts: TimeStamp) {
+        info!("save_safe_point_by_keyspace01");
+        let mut map = self.keyspace_safepoint.wl();
+        info!("save_safe_point_by_keyspace02");
+        let temp = keyspace.clone();
+        info!("save_safe_point_by_keyspace03");
+        let safe_point = map.get(&keyspace);
+        info!("save_safe_point_by_keyspace05");
+        match safe_point {
+            None => {
+                let current_safe_point = Arc::new(AtomicU64::new(ts.into_inner()));
+                info!("test save_safe_point_by_keyspace01:{:?},{}",temp.as_slice(),current_safe_point.load(AtomicOrdering::Relaxed));
+                map.insert(temp, current_safe_point);
+            }
+            Some(current_safe_point) => {
+                current_safe_point.store(ts.into_inner(), AtomicOrdering::Relaxed);
+                info!("test save_safe_point_by_keyspace02:{:?},{}",temp.as_slice(),current_safe_point.load(AtomicOrdering::Relaxed));
+            }
+        }
     }
 
     /// Starts working in another thread. This function moves the `GcManager` and returns a handler
@@ -347,22 +380,141 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider + 'static, E: KvEngine> GcMan
         }
     }
 
+
+    //->Arc<RwLock<HashMap<Vec<u8>, Arc<AtomicU64>>>>
+    fn get_keyspace_safe_point(&mut self)->HashMap<Vec<u8>, Arc<AtomicU64>>{
+        let keyspace_safepoint = match self.cfg.safe_point_provider.get_rawkv_safe_point() {
+            Ok(res) => res,
+            // Return false directly so we will check it a while later.
+            Err(e) => {
+                error!(?e; "failed to keyspace get gc safe point from pd");
+                return HashMap::default();
+            }
+        };
+
+        let mut keyspace_safepoint_map = HashMap::default();
+
+        let keyspaces=keyspace_safepoint.get_key_spaces();
+        for keyspace in keyspaces {
+            let space_id =keyspace.get_space_id();
+            let temp_sp=keyspace.get_gc_safe_point();
+            info!("test safe_point:key01:{:?},sp:{}",space_id.to_vec(),temp_sp);
+
+
+            let safe_point=Arc::new(AtomicU64::new(keyspace.get_gc_safe_point()));
+            keyspace_safepoint_map.insert(space_id.to_vec(), Arc::clone(&safe_point));
+
+            let temp=Arc::clone(&safe_point);
+            let temp2=temp.load(AtomicOrdering::Relaxed);
+            let temp3=space_id.to_vec();
+            info!("test safe_point:key02:{:?},sp:{}",temp3,temp2);
+        }
+
+        keyspace_safepoint_map
+    }
+
+    fn is_in_keyspace_map(&mut self, all_old_safe_point:Arc<RwLock<HashMap<Vec<u8>, Arc<AtomicU64>>>>, keyspace: Vec<u8>) -> Option<u64>{
+        let ks_sp_map = all_old_safe_point.wl();
+        let get_safe_point = ks_sp_map.get(&keyspace);
+        let keyspace_name = keyspace.clone();
+        return match get_safe_point {
+            None => {
+                // This keyspace don't init safepoint
+
+                //self.save_safe_point_by_keyspace(keyspace_name, safe_point);
+                return None;
+            }
+            Some(_safe_point) => {
+
+                Some(_safe_point.load(AtomicOrdering::Relaxed))
+            },
+        }
+    }
+
+
+
+    fn try_update_keyspace_safe_point(&mut self) -> bool{
+
+        info!("BEGIN try_update_keyspace_safe_point");
+
+        let res=false;
+        let all_old_safe_point = Arc::clone(&self.curr_all_safe_point_by_keyspace());
+        let keyspace_safepoint=self.get_keyspace_safe_point();
+        info!("keyspace_safepoint size:{}",keyspace_safepoint.len());
+        for (keyspace,safepoint) in keyspace_safepoint {
+
+            let safe_point=TimeStamp::new(safepoint.load(AtomicOrdering::Relaxed));
+            info!("service_group == RAWKV01,{}",safe_point.into_inner());
+
+            let old_safe_point=self.is_in_keyspace_map(Arc::clone(&self.curr_all_safe_point_by_keyspace()),keyspace.clone());
+            let keyspace_name = keyspace.clone();
+            let old_safe_point_ts=match old_safe_point{
+                None => {
+                    info!("can't get old safepoint keyspace:{:?}",keyspace);
+                    self.save_safe_point_by_keyspace(keyspace_name, safe_point);
+                    return false;
+                }
+                Some(sp) => {
+                    sp
+                }
+            };
+
+            info!("service_group == RAWKV02,{}",old_safe_point_ts);
+            let old_safe_point = TimeStamp::new(old_safe_point_ts);
+
+            let res=match safe_point.cmp(&old_safe_point) {
+                Ordering::Less => {
+                    panic!(
+                        "got new safe point {} which is less than current safe point {}. \
+                     there must be something wrong.",
+                        safe_point, old_safe_point,
+                    );
+                }
+                Ordering::Equal => {
+                    info!("keyspace Equal");
+                    false
+                },
+                Ordering::Greater => {
+                    debug!("gc_worker: update safe point"; "safe_point" => safe_point);
+                    info!("keyspace save_safe_point_by_keyspace:{}",safe_point);
+                    self.save_safe_point_by_keyspace(keyspace_name, safe_point);
+                    AUTO_GC_SAFE_POINT_GAUGE.set(safe_point.into_inner() as i64);
+                    return true;
+                }
+            };
+            info!("service_group == RAWKV03");
+        }
+
+        //test check
+        let all_old_safe_point2 = self.curr_all_safe_point_by_keyspace();
+        let temp3=all_old_safe_point2.rl();
+        let temp4=temp3.deref();
+        for (keyspace,safepoint) in temp4 {
+            info!("service_group == RAWKV04");
+            let safe_point=TimeStamp::new(safepoint.load(AtomicOrdering::Relaxed));
+            info!("check keyspace gc safe_point_by_keyspace:{:?},{}",keyspace,safe_point);
+        }
+
+        false
+    }
+
     /// Tries to update the safe point. Returns true if safe point has been updated to a greater
     /// value. Returns false if safe point didn't change or we encountered an error.
     fn try_update_safe_point(&mut self) -> bool {
         self.safe_point_last_check_time = Instant::now();
 
-        let safe_point = match self.cfg.safe_point_provider.get_safe_point() {
-            Ok(res) => res,
-            // Return false directly so we will check it a while later.
-            Err(e) => {
-                error!(?e; "failed to get safe point from pd");
-                return false;
-            }
-        };
+            let safe_point = match self.cfg.safe_point_provider.get_safe_point() {
+                Ok(res) => res,
+                // Return false directly so we will check it a while later.
+                Err(e) => {
+                    error!(?e; "failed to get safe point from pd");
+                    return false;
+                }
+            };
+            let old_safe_point = self.curr_safe_point();
 
-        let old_safe_point = self.curr_safe_point();
-        match safe_point.cmp(&old_safe_point) {
+
+        let update_safe_point=match safe_point.cmp(&old_safe_point) {
             Ordering::Less => {
                 panic!(
                     "got new safe point {} which is less than current safe point {}. \
@@ -373,11 +525,16 @@ impl<S: GcSafePointProvider, R: RegionInfoProvider + 'static, E: KvEngine> GcMan
             Ordering::Equal => false,
             Ordering::Greater => {
                 debug!("gc_worker: update safe point"; "safe_point" => safe_point);
+                info!("gc_worker: update safe point save_safe_point:{}",safe_point);
                 self.save_safe_point(safe_point);
                 AUTO_GC_SAFE_POINT_GAUGE.set(safe_point.into_inner() as i64);
                 true
             }
-        }
+        };
+
+        info!("gc_worker: update keyspace before safepoint");
+        let update_keyspace_safepoint= self.try_update_keyspace_safe_point();
+        return update_safe_point || update_keyspace_safepoint;
     }
 
     /// Scans all regions on the TiKV whose leader is this TiKV, and does GC on all of them.
@@ -664,6 +821,12 @@ mod tests {
             // is not updated.
             self.rx.try_recv().map_err(|e| box_err!(e))
         }
+
+        fn get_rawkv_safe_point(&self) -> Result<TimeStamp> {
+            // Error will be ignored by `GcManager`, which is equivalent to that the safe_point
+            // is not updated.
+            self.rx.try_recv().map_err(|e| box_err!(e))
+        }
     }
 
     #[derive(Clone)]
@@ -724,6 +887,7 @@ mod tests {
             let gc_manager = GcManager::new(
                 cfg,
                 Arc::new(AtomicU64::new(0)),
+                Arc::new(RwLock::new(HashMap::default())),
                 scheduler,
                 GcWorkerConfigManager::default(),
                 Default::default(),

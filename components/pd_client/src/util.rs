@@ -23,6 +23,7 @@ use grpcio::{
 };
 use kvproto::{
     metapb::BucketStats,
+    gcpb::{GcClient as GcClientStub,KeySpace,ResponseHeader as GCResponseHeader},
     pdpb::{
         ErrorType, GetMembersRequest, GetMembersResponse, Member, PdClient as PdClientStub,
         RegionHeartbeatRequest, RegionHeartbeatResponse, ReportBucketsRequest,
@@ -95,6 +96,7 @@ pub struct Inner {
     >,
     pub buckets_resp: Option<ClientCStreamReceiver<ReportBucketsResponse>>,
     pub client_stub: PdClientStub,
+    pub gc_client_stub: GcClientStub,
     target: TargetInfo,
     members: GetMembersResponse,
     security_mgr: Arc<SecurityManager>,
@@ -163,6 +165,7 @@ impl Client {
         env: Arc<Environment>,
         security_mgr: Arc<SecurityManager>,
         client_stub: PdClientStub,
+        gc_client_stub: GcClientStub,
         members: GetMembersResponse,
         target: TargetInfo,
         tso: TimestampOracle,
@@ -188,6 +191,7 @@ impl Client {
                 buckets_sender: Either::Left(Some(buckets_tx)),
                 buckets_resp: Some(buckets_resp),
                 client_stub,
+                gc_client_stub,
                 members,
                 target,
                 security_mgr,
@@ -358,7 +362,7 @@ impl Client {
         }
 
         slow_log!(start.saturating_elapsed(), "try reconnect pd");
-        let (client, target_info, members, tso) = match future.await {
+        let (client,gc_client, target_info, members, tso) = match future.await {
             Err(e) => {
                 PD_RECONNECT_COUNTER_VEC
                     .with_label_values(&["failure"])
@@ -505,6 +509,7 @@ where
 
 pub type StubTuple = (
     PdClientStub,
+    GcClientStub,
     TargetInfo,
     GetMembersResponse,
     TimestampOracle,
@@ -530,7 +535,7 @@ impl PdConnector {
                 return Err(box_err!("duplicate PD endpoint {}", ep));
             }
 
-            let (_, resp) = match self.connect(ep).await {
+            let (_,gc_client, resp) = match self.connect(ep).await {
                 Ok(resp) => resp,
                 // Ignore failed PD node.
                 Err(e) => {
@@ -571,7 +576,7 @@ impl PdConnector {
         }
     }
 
-    pub async fn connect(&self, addr: &str) -> Result<(PdClientStub, GetMembersResponse)> {
+    pub async fn connect(&self, addr: &str) -> Result<(PdClientStub,GcClientStub, GetMembersResponse)> {
         info!("connecting to PD endpoint"; "endpoints" => addr);
         let addr_trim = trim_http_prefix(addr);
         let channel = {
@@ -583,15 +588,32 @@ impl PdConnector {
             self.security_mgr.connect(cb, addr_trim)
         };
         let client = PdClientStub::new(channel);
+        let gc_client=self.connect_gc(addr);
         let option = CallOption::default().timeout(Duration::from_secs(REQUEST_TIMEOUT));
         let response = client
             .get_members_async_opt(&GetMembersRequest::default(), option)
             .unwrap_or_else(|e| panic!("fail to request PD {} err {:?}", "get_members", e))
             .await;
         match response {
-            Ok(resp) => Ok((client, resp)),
+            Ok(resp) => Ok((client,gc_client.await, resp)),
             Err(e) => Err(Error::Grpc(e)),
         }
+    }
+
+    pub async fn connect_gc(&self, addr: &str) -> GcClientStub {
+        info!("connecting to PD endpoint"; "endpoints" => addr);
+        let addr_trim = trim_http_prefix(addr);
+        let channel = {
+            let cb = ChannelBuilder::new(self.env.clone())
+                .max_send_message_len(-1)
+                .max_receive_message_len(-1)
+                .keepalive_time(Duration::from_secs(10))
+                .keepalive_timeout(Duration::from_secs(3));
+            self.security_mgr.connect(cb, addr_trim)
+        };
+        let gc_client = GcClientStub::new(channel);
+
+        gc_client
     }
 
     pub async fn load_members(&self, previous: &GetMembersResponse) -> Result<GetMembersResponse> {
@@ -607,7 +629,7 @@ impl PdConnector {
         {
             for ep in m.get_client_urls() {
                 match self.connect(ep.as_str()).await {
-                    Ok((_, r)) => {
+                    Ok((_,gc_client, r)) => {
                         let new_cluster_id = r.get_header().get_cluster_id();
                         if new_cluster_id == cluster_id {
                             // check whether the response have leader info, otherwise continue to loop the rest members
@@ -655,14 +677,14 @@ impl PdConnector {
         }
         let (res, has_network_error) = self.reconnect_leader(leader).await?;
         match res {
-            Some((client, target_url)) => {
+            Some((client,gc_client, target_url)) => {
                 let info = TargetInfo::new(target_url, "");
                 let tso = TimestampOracle::new(
                     resp.get_header().get_cluster_id(),
                     &client,
                     info.call_option(),
                 )?;
-                return Ok(Some((client, info, resp, tso)));
+                return Ok(Some((client,gc_client, info, resp, tso)));
             }
             None => {
                 // If the force is false, we could have already forwarded the requests.
@@ -671,13 +693,13 @@ impl PdConnector {
                     return Err(box_err!("failed to connect to {:?}", leader));
                 }
                 if enable_forwarding && has_network_error {
-                    if let Ok(Some((client, info))) = self.try_forward(members, leader).await {
+                    if let Ok(Some((client,gc_client, info))) = self.try_forward(members, leader).await {
                         let tso = TimestampOracle::new(
                             resp.get_header().get_cluster_id(),
                             &client,
                             info.call_option(),
                         )?;
-                        return Ok(Some((client, info, resp, tso)));
+                        return Ok(Some((client,gc_client, info, resp, tso)));
                     }
                 }
             }
@@ -691,15 +713,15 @@ impl PdConnector {
     pub async fn connect_member(
         &self,
         peer: &Member,
-    ) -> Result<(Option<(PdClientStub, String, GetMembersResponse)>, bool)> {
+    ) -> Result<(Option<(PdClientStub,GcClientStub, String, GetMembersResponse)>, bool)> {
         let mut network_fail_num = 0;
         let mut has_network_error = false;
         let client_urls = peer.get_client_urls();
         for ep in client_urls {
             match self.connect(ep.as_str()).await {
-                Ok((client, resp)) => {
+                Ok((client,gc_client, resp)) => {
                     info!("connected to PD member"; "endpoints" => ep);
-                    return Ok((Some((client, ep.clone(), resp)), false));
+                    return Ok((Some((client,gc_client, ep.clone(), resp)), false));
                 }
                 Err(Error::Grpc(e)) => {
                     if let RpcFailure(ref status) = e {
@@ -724,7 +746,7 @@ impl PdConnector {
     pub async fn reconnect_leader(
         &self,
         leader: &Member,
-    ) -> Result<(Option<(PdClientStub, String)>, bool)> {
+    ) -> Result<(Option<(PdClientStub,GcClientStub, String)>, bool)> {
         fail_point!("connect_leader", |_| Ok((None, true)));
         let mut retry_times = MAX_RETRY_TIMES;
         let timer = Instant::now();
@@ -732,7 +754,7 @@ impl PdConnector {
         loop {
             let (res, has_network_err) = self.connect_member(leader).await?;
             match res {
-                Some((client, ep, _)) => return Ok((Some((client, ep)), has_network_err)),
+                Some((client,gc_client, ep, _)) => return Ok((Some((client,gc_client, ep)), has_network_err)),
                 None => {
                     if has_network_err
                         && retry_times > 0
@@ -755,12 +777,12 @@ impl PdConnector {
         &self,
         members: &[Member],
         leader: &Member,
-    ) -> Result<Option<(PdClientStub, TargetInfo)>> {
+    ) -> Result<Option<(PdClientStub,GcClientStub, TargetInfo)>> {
         // Try to connect the PD cluster follower.
         for m in members.iter().filter(|m| *m != leader) {
             let (res, _) = self.connect_member(m).await?;
             match res {
-                Some((client, ep, resp)) => {
+                Some((client,gc_client, ep, resp)) => {
                     let leader = resp.get_leader();
                     let client_urls = leader.get_client_urls();
                     for leader_url in client_urls {
@@ -777,7 +799,7 @@ impl PdConnector {
                             })
                             .await;
                         match response {
-                            Ok(_) => return Ok(Some((client, target))),
+                            Ok(_) => return Ok(Some((client,gc_client, target))),
                             Err(_) => continue,
                         }
                     }
@@ -812,6 +834,31 @@ pub fn check_resp_header(header: &ResponseHeader) -> Result<()> {
         }
         ErrorType::Ok => Ok(()),
     }
+}
+
+
+/**
+            0 => ::std::option::Option::Some(ErrorType::Ok),
+            1 => ::std::option::Option::Some(ErrorType::Unknown),
+            2 => ::std::option::Option::Some(ErrorType::NotBootstrapped),
+            3 => ::std::option::Option::Some(ErrorType::RevisionMismatch),
+            4 => ::std::option::Option::Some(ErrorType::SafepointRollback),
+*/
+
+/// Convert a PD protobuf error to an `Error`.
+pub fn check_gc_resp_header(header: &GCResponseHeader) -> Result<()> {
+    if !header.has_error() {
+        return Ok(());
+    }
+    let err = header.get_error();
+    Ok(())
+    // match err.get_type() {
+    //     ErrorType::Unknown => Err(gcpb::Error::ClusterBootstrapped(header.get_cluster_id())),
+    //     ErrorType::NotBootstrapped => Err(Error::ClusterNotBootstrapped(header.get_cluster_id())),
+    //     ErrorType::RevisionMismatch => Err(Error::Incompatible),
+    //     ErrorType::SafepointRollback => Err(Error::StoreTombstone(err.get_message().to_owned())),
+    //     ErrorType::Ok => Ok(()),
+    // }
 }
 
 pub fn new_bucket_stats(meta: &BucketMeta) -> BucketStats {

@@ -7,12 +7,13 @@ use std::{
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc::Sender,
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     vec::IntoIter,
 };
 
 use api_version::{ApiV2, KvFormat};
+use collections::HashMap;
 use concurrency_manager::ConcurrencyManager;
 use engine_rocks::FlowInfo;
 use engine_traits::{
@@ -24,6 +25,7 @@ use futures::executor::block_on;
 use kvproto::{
     kvrpcpb::{Context, LockInfo},
     metapb::Region,
+    gcpb::{self,ListKeySpacesResponse},
 };
 use pd_client::{FeatureGate, PdClient};
 use raftstore::{
@@ -74,11 +76,19 @@ const GC_MAX_PENDING_TASKS: usize = 4096;
 /// Provides safe point.
 pub trait GcSafePointProvider: Send + 'static {
     fn get_safe_point(&self) -> Result<TimeStamp>;
+    fn get_rawkv_safe_point(&self) -> Result<ListKeySpacesResponse>;
 }
 
 impl<T: PdClient + 'static> GcSafePointProvider for Arc<T> {
     fn get_safe_point(&self) -> Result<TimeStamp> {
         block_on(self.get_gc_safe_point())
+            .map(Into::into)
+            .map_err(|e| box_err!("failed to get safe point from PD: {:?}", e))
+    }
+
+    fn get_rawkv_safe_point(&self) -> Result<ListKeySpacesResponse> {
+        info!("test get_rawkv_safe_point01");
+        block_on(self.get_gc_safe_point_by_keyspace(true))
             .map(Into::into)
             .map_err(|e| box_err!("failed to get safe point from PD: {:?}", e))
     }
@@ -984,6 +994,7 @@ where
     applied_lock_collector: Option<Arc<AppliedLockCollector>>,
 
     gc_manager_handle: Arc<Mutex<Option<GcManagerHandle>>>,
+    raw_gc_manager_handle: Arc<Mutex<Option<GcManagerHandle>>>,
     feature_gate: FeatureGate,
 }
 
@@ -1006,6 +1017,7 @@ where
             worker_scheduler: self.worker_scheduler.clone(),
             applied_lock_collector: self.applied_lock_collector.clone(),
             gc_manager_handle: self.gc_manager_handle.clone(),
+            raw_gc_manager_handle: self.raw_gc_manager_handle.clone(),
             feature_gate: self.feature_gate.clone(),
         }
     }
@@ -1056,6 +1068,7 @@ where
             worker_scheduler,
             applied_lock_collector: None,
             gc_manager_handle: Arc::new(Mutex::new(None)),
+            raw_gc_manager_handle: Arc::new(Mutex::new(None)),
             feature_gate,
         }
     }
@@ -1070,10 +1083,16 @@ where
             "AutoGcConfig::self_store_id shouldn't be 0"
         );
 
+        //GC TODO ：get all keyspace, init map(key:keyspace,value:safepoint)
+        let mut keyspace_safepoint = HashMap::default();
+
+        let map_arc: Arc<RwLock<HashMap<Vec<u8>, Arc<AtomicU64>>>> =
+            Arc::new(RwLock::new(keyspace_safepoint));
         info!("initialize compaction filter to perform GC when necessary");
         self.engine.kv_engine().init_compaction_filter(
             cfg.self_store_id,
             safe_point.clone(),
+            Arc::clone(&map_arc),
             self.config_manager.clone(),
             self.feature_gate.clone(),
             self.scheduler(),
@@ -1086,6 +1105,7 @@ where
         let new_handle = GcManager::new(
             cfg,
             safe_point,
+            Arc::clone(&map_arc),
             self.scheduler(),
             self.config_manager.clone(),
             self.feature_gate.clone(),
@@ -1663,6 +1683,10 @@ mod tests {
     struct MockSafePointProvider(u64);
     impl GcSafePointProvider for MockSafePointProvider {
         fn get_safe_point(&self) -> Result<TimeStamp> {
+            Ok(self.0.into())
+        }
+
+        fn get_rawkv_safe_point(&self) -> Result<ListKeySpacesResponse> {
             Ok(self.0.into())
         }
     }

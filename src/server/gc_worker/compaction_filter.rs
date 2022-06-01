@@ -7,11 +7,12 @@ use std::{
     result::Result,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
     time::Duration,
 };
 
+use collections::HashMap;
 use engine_rocks::{
     raw::{
         new_compaction_filter_raw, CompactionFilter, CompactionFilterContext,
@@ -52,7 +53,8 @@ pub struct GcContext {
     pub(crate) db: RocksEngine,
     pub(crate) store_id: u64,
     pub(crate) safe_point: Arc<AtomicU64>,
-    cfg_tracker: GcWorkerConfigManager,
+    pub(crate) keyspace_safepoint: Arc<RwLock<HashMap<Vec<u8>, Arc<AtomicU64>>>>,
+    pub(crate) cfg_tracker: GcWorkerConfigManager,
     feature_gate: FeatureGate,
     pub(crate) gc_scheduler: Scheduler<GcTask<RocksEngine>>,
     pub(crate) region_info_provider: Arc<dyn RegionInfoProvider + 'static>,
@@ -134,6 +136,7 @@ where
         &self,
         store_id: u64,
         safe_point: Arc<AtomicU64>,
+        keyspace_safepoint: Arc<RwLock<HashMap<Vec<u8>, Arc<AtomicU64>>>>,
         cfg_tracker: GcWorkerConfigManager,
         feature_gate: FeatureGate,
         gc_scheduler: Scheduler<GcTask<EK>>,
@@ -149,6 +152,7 @@ where
         &self,
         _store_id: u64,
         _safe_point: Arc<AtomicU64>,
+        _keyspace_safepoint: Arc<RwLock<HashMap<Vec<u8>, Arc<AtomicU64>>>>,
         _cfg_tracker: GcWorkerConfigManager,
         _feature_gate: FeatureGate,
         _gc_scheduler: Scheduler<GcTask<EK>>,
@@ -163,6 +167,7 @@ impl CompactionFilterInitializer<RocksEngine> for RocksEngine {
         &self,
         store_id: u64,
         safe_point: Arc<AtomicU64>,
+        keyspace_safepoint: Arc<RwLock<HashMap<Vec<u8>, Arc<AtomicU64>>>>,
         cfg_tracker: GcWorkerConfigManager,
         feature_gate: FeatureGate,
         gc_scheduler: Scheduler<GcTask<RocksEngine>>,
@@ -174,6 +179,7 @@ impl CompactionFilterInitializer<RocksEngine> for RocksEngine {
             db: self.clone(),
             store_id,
             safe_point,
+            keyspace_safepoint,
             cfg_tracker,
             feature_gate,
             gc_scheduler,
@@ -698,6 +704,8 @@ fn check_need_gc(
 #[allow(dead_code)] // Some interfaces are not used with different compile options.
 #[cfg(any(test, feature = "failpoints"))]
 pub mod test_utils {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
     use engine_rocks::{
         raw::{CompactOptions, CompactionOptions},
         util::get_cf_handle,
@@ -708,6 +716,7 @@ pub mod test_utils {
     use tikv_util::{
         config::VersionTrack,
         worker::{dummy_scheduler, ReceiverWrapper},
+        HandyRwLock,
     };
 
     use super::*;
@@ -743,6 +752,7 @@ pub mod test_utils {
         pub gc_scheduler: Scheduler<GcTask<RocksEngine>>,
         pub gc_receiver: ReceiverWrapper<GcTask<RocksEngine>>,
         pub(super) callbacks_on_drop: Vec<Arc<dyn Fn(&WriteCompactionFilter) + Send + Sync>>,
+        pub keyspace_safepoint: Arc<RwLock<HashMap<Vec<u8>, Arc<AtomicU64>>>>,
     }
 
     impl<'a> TestGCRunner<'a> {
@@ -758,6 +768,7 @@ pub mod test_utils {
                 gc_scheduler,
                 gc_receiver,
                 callbacks_on_drop: vec![],
+                keyspace_safepoint: Arc::new(RwLock::new(HashMap::default())),
             }
         }
     }
@@ -768,7 +779,30 @@ pub mod test_utils {
             self
         }
 
+        pub fn set_keyspace_safe_point(&mut self, keyspace: Vec<u8>, ts: u64) {
+            let mut map = self.keyspace_safepoint.wl();
+            let safe_point = map.get(&keyspace);
+            match safe_point {
+                None => {
+                    let current_safe_point = Arc::new(AtomicU64::new(ts));
+                    map.insert(keyspace, current_safe_point);
+                }
+                Some(current_safe_point) => {
+                    current_safe_point.store(ts, AtomicOrdering::Relaxed);
+                }
+            };
+        }
+
+        pub fn getleng(&mut self) {
+            let map = self.keyspace_safepoint.rl();
+            println!("map size:{}", map.len());
+        }
+
         fn prepare_gc(&self, engine: &RocksEngine) {
+            self.prepare_gc_internal(engine, false);
+        }
+
+        fn prepare_gc_internal(&self, engine: &RocksEngine, is_key_space: bool) {
             let safe_point = Arc::new(AtomicU64::new(self.safe_point));
             let cfg_tracker = {
                 let mut cfg = GcConfig::default();
@@ -776,6 +810,9 @@ pub mod test_utils {
                     cfg.ratio_threshold = ratio_threshold;
                 }
                 cfg.enable_compaction_filter = true;
+                if is_key_space {
+                    cfg.enable_key_space = true;
+                }
                 GcWorkerConfigManager(Arc::new(VersionTrack::new(cfg)))
             };
             let feature_gate = {
@@ -794,6 +831,7 @@ pub mod test_utils {
                 gc_scheduler: self.gc_scheduler.clone(),
                 region_info_provider: Arc::new(MockRegionInfoProvider::new(vec![])),
                 callbacks_on_drop: self.callbacks_on_drop.clone(),
+                keyspace_safepoint: Arc::clone(&self.keyspace_safepoint),
             });
         }
 
@@ -819,9 +857,9 @@ pub mod test_utils {
             self.post_gc();
         }
 
-        pub fn gc_raw(&mut self, engine: &RocksEngine) {
+        pub fn gc_raw(&mut self, engine: &RocksEngine, is_key_space: bool) {
             let _guard = LOCK.lock().unwrap();
-            self.prepare_gc(engine);
+            self.prepare_gc_internal(engine, is_key_space);
 
             let db = engine.as_inner();
             let handle = get_cf_handle(db, CF_DEFAULT).unwrap();

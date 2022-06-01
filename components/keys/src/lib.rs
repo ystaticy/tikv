@@ -56,6 +56,9 @@ pub const SNAPSHOT_RAFT_STATE_SUFFIX: u8 = 0x04;
 // For region meta
 pub const REGION_STATE_SUFFIX: u8 = 0x01;
 
+pub const DEFAULT_TXN_KEYSPACE: &str = "default_txn";
+pub const DEFAULT_RAW_KEYSPACE: &str = "default_raw";
+
 #[inline]
 fn make_region_prefix(region_id: u64, suffix: u8) -> [u8; 11] {
     let mut key = [0; 11];

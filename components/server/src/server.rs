@@ -976,6 +976,10 @@ impl<ER: RaftEngine> TiKvServer<ER> {
             fatal!("failed to start auto_gc on storage, error: {}", e);
         }
 
+        // if let Err(e) = gc_worker.start_auto_gc_v2(auto_gc_config,auto_raw_gc_config, safe_point,raw_safe_point) {
+        //     fatal!("failed to start auto_gc on storage, error: {}", e);
+        // }
+
         initial_metric(&self.config.metric);
         if self.config.storage.enable_ttl {
             ttl_checker.start_with_timer(TtlChecker::new(

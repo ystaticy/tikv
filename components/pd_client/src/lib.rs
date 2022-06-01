@@ -10,12 +10,13 @@ mod util;
 
 mod config;
 pub mod errors;
+
 use std::{cmp::Ordering, collections::HashMap, ops::Deref, sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
 use grpcio::ClientSStreamReceiver;
 use kvproto::{
-    metapb, pdpb,
+    metapb, pdpb,gcpb::{self,ListKeySpacesResponse},
     replication_modepb::{RegionReplicationStatus, ReplicationStatus, StoreDrAutoSyncStatus},
 };
 use pdpb::{QueryStats, WatchGlobalConfigResponse};
@@ -390,6 +391,10 @@ pub trait PdClient: Send + Sync {
     }
 
     fn get_gc_safe_point(&self) -> PdFuture<u64> {
+        unimplemented!();
+    }
+
+    fn get_gc_safe_point_by_keyspace(&self,withGCSafePoint: bool) -> PdFuture<ListKeySpacesResponse> {
         unimplemented!();
     }
 
