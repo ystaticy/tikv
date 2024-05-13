@@ -285,7 +285,7 @@ impl ApiV2 {
                 prefix
             }
             KeyMode::Tidb | KeyMode::Unknown => {
-                return vec![];
+                vec![]
             }
         }
     }
