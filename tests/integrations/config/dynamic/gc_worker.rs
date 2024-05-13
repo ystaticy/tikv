@@ -35,7 +35,7 @@ fn setup_cfg_controller(
         cfg.gc.clone(),
         Default::default(),
         Arc::new(MockRegionInfoProvider::new(Vec::new())),
-        Arc::new(Some(KeyspaceLevelGCService::default())),
+        Arc::new(KeyspaceLevelGCService::default()),
     );
     gc_worker.start(0).unwrap();
 

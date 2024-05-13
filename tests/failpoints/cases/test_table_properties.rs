@@ -119,7 +119,7 @@ fn test_check_need_gc() {
 
 // make_keyspace_level_gc_service is used to construct the required keyspace
 // metas, mappings, and keyspace level GC service.
-fn make_keyspace_level_gc_service() -> Arc<Option<KeyspaceLevelGCService>> {
+fn make_keyspace_level_gc_service() -> Arc<KeyspaceLevelGCService> {
     let mut keyspace_config = HashMap::new();
     keyspace_config.insert(
         keyspace_meta::KEYSPACE_CONFIG_KEY_GC_MGMT_TYPE.to_string(),
@@ -166,46 +166,39 @@ fn make_keyspace_level_gc_service() -> Arc<Option<KeyspaceLevelGCService>> {
 
     let keyspace_id_meta_cache = Arc::new(keyspace_id_meta_map);
 
-    Arc::new(Some(KeyspaceLevelGCService::new(
+    Arc::new(KeyspaceLevelGCService::new(
         Arc::clone(&keyspace_level_gc_map),
         Arc::clone(&keyspace_id_meta_cache),
-    )))
+    ))
 }
 
 #[test]
 fn test_keyspace_level_gc_service() {
     // Make empty cache in keyspace_level_gc_service.
-    let keyspace_level_gc_service = Arc::new(Some(KeyspaceLevelGCService::new(
+    let keyspace_level_gc_service = Arc::new(KeyspaceLevelGCService::new(
         Arc::clone(&Default::default()),
         Arc::clone(&Default::default()),
-    )));
+    ));
 
     // Case 1: If there is no keyspace level GC in cache, then
     // is_all_keyspace_level_gc_have_not_initialized return true.
-    assert_eq!(true, keyspace_level_gc_service.is_some());
-    if let Some(ref ks_meta_service) = *keyspace_level_gc_service {
-        let is_all_keyspace_level_gc_have_not_initialized =
-            ks_meta_service.is_all_keyspace_level_gc_have_not_initialized();
-        assert_eq!(true, is_all_keyspace_level_gc_have_not_initialized);
-    }
+    let is_all_keyspace_level_gc_have_not_initialized =
+        keyspace_level_gc_service.is_all_keyspace_level_gc_have_not_initialized();
+    assert_eq!(true, is_all_keyspace_level_gc_have_not_initialized);
 
     // Case 2: If there have any keyspace level GC in cache, then
     // is_all_keyspace_level_gc_have_not_initialized return false.
     let keyspace_level_gc_service = make_keyspace_level_gc_service();
-    assert_eq!(true, keyspace_level_gc_service.is_some());
 
-    if let Some(ref ks_meta_service) = *keyspace_level_gc_service {
-        let is_all_keyspace_level_gc_have_not_initialized =
-            ks_meta_service.is_all_keyspace_level_gc_have_not_initialized();
-        assert_eq!(false, is_all_keyspace_level_gc_have_not_initialized);
-    }
+    let is_all_keyspace_level_gc_have_not_initialized =
+        keyspace_level_gc_service.is_all_keyspace_level_gc_have_not_initialized();
+    assert_eq!(false, is_all_keyspace_level_gc_have_not_initialized);
 
     // Case 3: Check get_max_ts_of_all_ks_gc_safe_point will return max(all keyspace
     // level GC safe point).
-    if let Some(ref ks_meta_service) = *keyspace_level_gc_service {
-        let max_ts_of_all_ks_gc_safe_point = ks_meta_service.get_max_ts_of_all_ks_gc_safe_point();
-        assert_eq!(69, max_ts_of_all_ks_gc_safe_point);
-    }
+    let max_ts_of_all_ks_gc_safe_point =
+        keyspace_level_gc_service.get_max_ts_of_all_ks_gc_safe_point();
+    assert_eq!(69, max_ts_of_all_ks_gc_safe_point);
 }
 
 #[test]

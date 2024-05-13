@@ -268,6 +268,14 @@ impl ApiV2 {
         }
     }
 
+    pub fn get_keyspace_id_to_txnkv_prefix(keyspace_id: u32) -> Vec<u8> {
+        let keyspace_id_bytes = keyspace_id.to_be_bytes();
+        let mut prefix = Vec::with_capacity(4);
+        prefix.push(TXN_KEY_PREFIX);
+        prefix.extend_from_slice(&keyspace_id_bytes[1..4]);
+        prefix
+    }
+
     pub const ENCODED_LOGICAL_DELETE: [u8; 1] = [ValueMeta::DELETE_FLAG.bits];
 }
 
@@ -469,5 +477,11 @@ mod tests {
         for (key, expected) in cases.into_iter() {
             assert_eq!(ApiV2::get_u32_keyspace_id_by_key(&key), expected);
         }
+    }
+
+    #[test]
+    fn test_get_txnkv_prefix_of_keyspace_id() {
+        let txn_prefix = ApiV2::get_keyspace_id_to_txnkv_prefix(1);
+        assert_eq!(txn_prefix, vec![b'x', 0, 0, 1]);
     }
 }

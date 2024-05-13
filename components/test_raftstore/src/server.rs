@@ -350,7 +350,7 @@ impl<EK: KvEngineWithRocks> ServerCluster<EK> {
             cfg.gc.clone(),
             Default::default(),
             Arc::new(region_info_accessor.clone()),
-            Arc::new(Some(KeyspaceLevelGCService::default())),
+            Arc::new(KeyspaceLevelGCService::default()),
         );
         gc_worker.start(node_id).unwrap();
 

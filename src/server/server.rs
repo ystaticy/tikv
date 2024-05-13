@@ -627,7 +627,7 @@ mod tests {
             Default::default(),
             Default::default(),
             Arc::new(MockRegionInfoProvider::new(Vec::new())),
-            Arc::new(Some(KeyspaceLevelGCService::default())),
+            Arc::new(KeyspaceLevelGCService::default()),
         );
         gc_worker.start(mock_store_id).unwrap();
 

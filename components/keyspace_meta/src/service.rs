@@ -444,4 +444,18 @@ impl KeyspaceLevelGCService {
         );
         max_ks_level_gc_sp
     }
+
+    pub fn get_keyspace_level_gc_map(&self) -> Arc<DashMap<u32, u64>> {
+        self.keyspace_level_gc_map.clone()
+    }
+
+    pub fn get_keyspace_id_meta_map(&self) -> Arc<DashMap<u32, KeyspaceMeta>> {
+        self.keyspace_id_meta_map.clone()
+    }
+
+    // For ut.
+    pub fn update_keyspace_level_gc_map(&self, keyspace_id: u32, gc_safe_point: u64) {
+        self.keyspace_level_gc_map
+            .insert(keyspace_id, gc_safe_point);
+    }
 }

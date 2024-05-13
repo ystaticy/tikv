@@ -549,10 +549,10 @@ where
             Arc::clone(&keyspace_level_gc_map),
         );
 
-        let keyspace_level_gc_service = Arc::new(Some(KeyspaceLevelGCService::new(
+        let keyspace_level_gc_service = Arc::new(KeyspaceLevelGCService::new(
             Arc::clone(&keyspace_level_gc_map),
             Arc::clone(&keyspace_id_meta_map),
-        )));
+        ));
 
         let engines = self.engines.as_ref().unwrap();
         let gc_worker = GcWorker::new(

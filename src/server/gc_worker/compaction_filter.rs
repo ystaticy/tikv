@@ -60,7 +60,7 @@ pub struct GcContext {
     #[cfg(any(test, feature = "failpoints"))]
     callbacks_on_drop: Vec<Arc<dyn Fn(&WriteCompactionFilter) + Send + Sync>>,
 
-    pub(crate) keyspace_level_gc_service: Arc<Option<KeyspaceLevelGCService>>,
+    pub(crate) keyspace_level_gc_service: Arc<KeyspaceLevelGCService>,
 }
 
 // Give all orphan versions an ID to log them.
@@ -152,7 +152,7 @@ where
         feature_gate: FeatureGate,
         gc_scheduler: Scheduler<GcTask<EK>>,
         region_info_provider: Arc<dyn RegionInfoProvider>,
-        keyspace_level_gc_service: Arc<Option<KeyspaceLevelGCService>>,
+        keyspace_level_gc_service: Arc<KeyspaceLevelGCService>,
     );
 }
 
@@ -168,7 +168,7 @@ where
         _feature_gate: FeatureGate,
         _gc_scheduler: Scheduler<GcTask<EK>>,
         _region_info_provider: Arc<dyn RegionInfoProvider>,
-        _keyspace_level_gc_service: Arc<Option<KeyspaceLevelGCService>>,
+        _keyspace_level_gc_service: Arc<KeyspaceLevelGCService>,
     ) {
         info!("Compaction filter is not supported for this engine.");
     }
@@ -183,7 +183,7 @@ impl CompactionFilterInitializer<RocksEngine> for Option<RocksEngine> {
         feature_gate: FeatureGate,
         gc_scheduler: Scheduler<GcTask<RocksEngine>>,
         region_info_provider: Arc<dyn RegionInfoProvider>,
-        keyspace_level_gc_service: Arc<Option<KeyspaceLevelGCService>>,
+        keyspace_level_gc_service: Arc<KeyspaceLevelGCService>,
     ) {
         info!("initialize GC context for compaction filter");
         let mut gc_context = GC_CONTEXT.lock().unwrap();
@@ -223,10 +223,8 @@ impl CompactionFilterFactory for WriteCompactionFilterFactory {
         // compaction filter.
         let keyspace_level_gc_service = gc_context.keyspace_level_gc_service.clone();
         let mut is_all_ks_not_init_gc_sp = true;
-        if let Some(ref ks_meta_service) = *keyspace_level_gc_service {
-            is_all_ks_not_init_gc_sp =
-                ks_meta_service.is_all_keyspace_level_gc_have_not_initialized()
-        }
+        is_all_ks_not_init_gc_sp =
+            keyspace_level_gc_service.is_all_keyspace_level_gc_have_not_initialized();
 
         if safe_point == 0 && is_all_ks_not_init_gc_sp {
             // Safe point has not been initialized yet.
@@ -252,7 +250,6 @@ impl CompactionFilterFactory for WriteCompactionFilterFactory {
             "creating compaction filter"; "feature_enable" => enable,
             "skip_version_check" => skip_vcheck,
             "ratio_threshold" => ratio_threshold,
-            "keyspace_level_gc_service_is_some" => keyspace_level_gc_service.is_some(),
         );
 
         if db
@@ -383,7 +380,7 @@ pub struct WriteCompactionFilter {
     #[cfg(any(test, feature = "failpoints"))]
     callbacks_on_drop: Vec<Arc<dyn Fn(&WriteCompactionFilter) + Send + Sync>>,
 
-    keyspace_level_gc_service: Arc<Option<KeyspaceLevelGCService>>,
+    keyspace_level_gc_service: Arc<KeyspaceLevelGCService>,
 }
 
 impl WriteCompactionFilter {
@@ -393,14 +390,12 @@ impl WriteCompactionFilter {
         context: &CompactionFilterContext,
         gc_scheduler: Scheduler<GcTask<RocksEngine>>,
         regions_provider: (u64, Arc<dyn RegionInfoProvider>),
-        keyspace_level_gc_service: Arc<Option<KeyspaceLevelGCService>>,
+        keyspace_level_gc_service: Arc<KeyspaceLevelGCService>,
     ) -> Self {
         // Safe point must have been initialized.
         let mut is_all_ks_not_init_gc_sp = true;
-        if let Some(ref ks_meta_service) = *keyspace_level_gc_service {
-            is_all_ks_not_init_gc_sp =
-                ks_meta_service.is_all_keyspace_level_gc_have_not_initialized()
-        }
+        is_all_ks_not_init_gc_sp =
+            keyspace_level_gc_service.is_all_keyspace_level_gc_have_not_initialized();
         assert!(safe_point > 0 || !is_all_ks_not_init_gc_sp);
         debug!("gc in compaction filter"; "safe_point" => safe_point);
 
@@ -491,10 +486,9 @@ impl WriteCompactionFilter {
     ) -> Result<CompactionFilterDecision, String> {
         let (mvcc_key_prefix, commit_ts) = split_ts(key)?;
 
-        if let Some(keyspace_level_gc_service) = self.keyspace_level_gc_service.as_ref() {
-            self.safe_point = keyspace_level_gc_service
-                .get_gc_safe_point_by_key(self.safe_point, keys::origin_key(key));
-        }
+        self.safe_point = self
+            .keyspace_level_gc_service
+            .get_gc_safe_point_by_key(self.safe_point, keys::origin_key(key));
 
         if commit_ts > self.safe_point || value_type != CompactionFilterValueType::Value {
             return Ok(CompactionFilterDecision::Keep);
@@ -789,7 +783,7 @@ pub fn check_need_gc(
     safe_point: TimeStamp,
     ratio_threshold: f64,
     context: &CompactionFilterContext,
-    keyspace_level_gc_service: Arc<Option<KeyspaceLevelGCService>>,
+    keyspace_level_gc_service: Arc<KeyspaceLevelGCService>,
 ) -> bool {
     let check_props = |props: &MvccProperties| -> (bool, bool /* skip_more_checks */) {
         // Disable GC directly once the config is negative or +inf.
@@ -804,15 +798,13 @@ pub fn check_need_gc(
         // Check is there any keyspace level GC safe point >= props.min_ts, the
         // following check should proceed.
         let mut any_ks_gc_sp_ge_than_props_min_ts = false;
-        if let Some(ref ks_meta_service) = *keyspace_level_gc_service {
-            let max_all_ks_gc_sp = ks_meta_service.get_max_ts_of_all_ks_gc_safe_point();
-            debug!("check props.min_ts and max ts of all keyspace level gc safe point";
-                "props.min_ts" => %props.min_ts,
-                "max_gc_sp_of_all_ks" => %max_all_ks_gc_sp,
-            );
-            if props.min_ts <= max_all_ks_gc_sp.into() {
-                any_ks_gc_sp_ge_than_props_min_ts = true;
-            }
+        let max_all_ks_gc_sp = keyspace_level_gc_service.get_max_ts_of_all_ks_gc_safe_point();
+        debug!("check props.min_ts and max ts of all keyspace level gc safe point";
+            "props.min_ts" => %props.min_ts,
+            "max_gc_sp_of_all_ks" => %max_all_ks_gc_sp,
+        );
+        if props.min_ts <= max_all_ks_gc_sp.into() {
+            any_ks_gc_sp_ge_than_props_min_ts = true;
         }
         if props.min_ts > safe_point && !any_ks_gc_sp_ge_than_props_min_ts {
             debug!("skip gc in compaction filter because of props.min_ts greater than all gc safe point";
@@ -913,16 +905,16 @@ pub mod test_utils {
         pub gc_scheduler: Scheduler<GcTask<RocksEngine>>,
         pub gc_receiver: ReceiverWrapper<GcTask<RocksEngine>>,
         pub(super) callbacks_on_drop: Vec<Arc<dyn Fn(&WriteCompactionFilter) + Send + Sync>>,
-        pub keyspace_level_gc_service: Arc<Option<KeyspaceLevelGCService>>,
+        pub keyspace_level_gc_service: Arc<KeyspaceLevelGCService>,
     }
 
     impl<'a> TestGcRunner<'a> {
         pub fn new(safe_point: u64) -> Self {
             let (gc_scheduler, gc_receiver) = dummy_scheduler();
-            let keyspace_level_gc_service = Arc::new(Some(KeyspaceLevelGCService::new(
+            let keyspace_level_gc_service = Arc::new(KeyspaceLevelGCService::new(
                 Arc::clone(&Default::default()),
                 Arc::clone(&Default::default()),
-            )));
+            ));
             TestGcRunner {
                 safe_point,
                 ratio_threshold: None,
@@ -940,6 +932,16 @@ pub mod test_utils {
     impl<'a> TestGcRunner<'a> {
         pub fn safe_point(&mut self, sp: u64) -> &mut Self {
             self.safe_point = sp;
+            self
+        }
+
+        pub fn update_gc_safe_point(&mut self, keyspace_id: Option<u32>, sp: u64) -> &mut Self {
+            if let Some(ks_id) = keyspace_id.as_ref() {
+                self.keyspace_level_gc_service
+                    .update_keyspace_level_gc_map(*ks_id, sp);
+            } else {
+                self.safe_point(sp);
+            }
             self
         }
 

@@ -1170,7 +1170,7 @@ where
 
     gc_manager_handle: Arc<Mutex<Option<GcManagerHandle>>>,
     feature_gate: FeatureGate,
-    keyspace_level_gc_service: Arc<Option<KeyspaceLevelGCService>>,
+    keyspace_level_gc_service: Arc<KeyspaceLevelGCService>,
 }
 
 impl<E: Engine> Clone for GcWorker<E> {
@@ -1216,7 +1216,7 @@ impl<E: Engine> GcWorker<E> {
         cfg: GcConfig,
         feature_gate: FeatureGate,
         region_info_provider: Arc<dyn RegionInfoProvider>,
-        keyspace_level_gc_service: Arc<Option<KeyspaceLevelGCService>>,
+        keyspace_level_gc_service: Arc<KeyspaceLevelGCService>,
     ) -> Self {
         let worker_builder = WorkerBuilder::new("gc-worker")
             .pending_capacity(GC_MAX_PENDING_TASKS)
@@ -1705,7 +1705,7 @@ mod tests {
             gc_config,
             gate,
             Arc::new(MockRegionInfoProvider::new(vec![region1, region2])),
-            Arc::new(Some(KeyspaceLevelGCService::default())),
+            Arc::new(KeyspaceLevelGCService::default()),
         );
         gc_worker.start(store_id).unwrap();
         // Convert keys to key value pairs, where the value is "value-{key}".
@@ -1884,7 +1884,7 @@ mod tests {
             gc_config,
             feature_gate,
             Arc::new(ri_provider.clone()),
-            Arc::new(Some(KeyspaceLevelGCService::default())),
+            Arc::new(KeyspaceLevelGCService::default()),
         );
         gc_worker.start(store_id).unwrap();
 
@@ -2279,7 +2279,7 @@ mod tests {
             gc_config,
             gate,
             Arc::new(MockRegionInfoProvider::new(vec![region.clone()])),
-            Arc::new(Some(KeyspaceLevelGCService::default())),
+            Arc::new(KeyspaceLevelGCService::default()),
         );
 
         // Before starting gc_worker, fill the scheduler to full.
@@ -2842,7 +2842,7 @@ mod tests {
             gc_config,
             gate,
             Arc::new(MockRegionInfoProvider::new(vec![])),
-            Arc::new(Some(KeyspaceLevelGCService::default())),
+            Arc::new(KeyspaceLevelGCService::default()),
         );
         let mut config_change = ConfigChange::new();
         config_change.insert(String::from("num_threads"), ConfigValue::Usize(5));
