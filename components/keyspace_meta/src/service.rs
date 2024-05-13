@@ -368,7 +368,7 @@ impl KeyspaceLevelGCService {
                 let keyspace_gc_safe_point_opt = self.keyspace_level_gc_map.get(&keyspace_id);
                 match keyspace_gc_safe_point_opt {
                     Some(keyspace_id_2_safe_point) => {
-                        debug!(
+                        println!(
                             "[keyspace level gc service] keyspace id:{}, can get keyspace level gc safe point:{}",
                             keyspace_id,
                             *keyspace_id_2_safe_point.value()
@@ -384,7 +384,7 @@ impl KeyspaceLevelGCService {
                             self.is_keyspace_use_global_gc_safe_point(keyspace_id);
                         if is_keyspace_use_global_gc_safe_point {
                             // keyspace use global GC.
-                            debug!(
+                            println!(
                                 "[keyspace level gc service] keyspace id:{}, keyspace use global GC, return gc safe point:{}",
                                 keyspace_id, safe_point
                             );
@@ -396,7 +396,7 @@ impl KeyspaceLevelGCService {
                             // may be GC safe point of this keyspace hasn't been calculated or
                             // watched yet, so just return 0 here.
                             // Because we can't give an unsafe value greater than 0.
-                            debug!(
+                            println!(
                                 "[keyspace level gc service] keyspace id:{}, keyspace can't get keyspace level GC, and don't use global GC, return gc safe point 0",
                                 keyspace_id
                             );

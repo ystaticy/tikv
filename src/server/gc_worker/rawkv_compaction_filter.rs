@@ -378,7 +378,6 @@ pub fn make_key(key: &[u8], ts: u64) -> Vec<u8> {
 
 #[cfg(test)]
 pub mod tests {
-
     use std::time::Duration;
 
     use api_version::RawValue;
@@ -389,7 +388,12 @@ pub mod tests {
 
     use super::*;
     use crate::{
-        config::DbConfig, server::gc_worker::TestGcRunner, storage::kv::TestEngineBuilder,
+        config::DbConfig,
+        server::gc_worker::{
+            make_keyspace_level_gc_service, make_keyspace_user_key, TestGcRunner,
+            TEST_GLOBAL_GC_KEYSPACE_ID,
+        },
+        storage::kv::TestEngineBuilder,
     };
 
     #[test]
@@ -404,12 +408,16 @@ pub mod tests {
             .unwrap();
         let raw_engine = engine.get_rocksdb();
         let mut gc_runner = TestGcRunner::new(0);
-        let user_key = b"r\0aaaaaaaaaaa";
+        gc_runner.keyspace_level_gc_service = make_keyspace_level_gc_service();
+
+        let user_key = b"aaaaaaaaaaa";
+        let user_key_expire_vec =
+            make_keyspace_user_key(KeyMode::Raw, TEST_GLOBAL_GC_KEYSPACE_ID, user_key.to_vec());
 
         let test_raws = vec![
-            (user_key, 100, false),
-            (user_key, 90, false),
-            (user_key, 70, false),
+            (user_key_expire_vec.as_slice(), 100, false),
+            (user_key_expire_vec.as_slice(), 90, false),
+            (user_key_expire_vec.as_slice(), 70, false),
         ];
 
         let modifies = test_raws
@@ -447,10 +455,16 @@ pub mod tests {
         gc_runner.safe_point(90).gc_raw(&raw_engine);
 
         let entry100 = raw_engine
-            .get_value_cf(CF_DEFAULT, make_key(user_key, 100).as_slice())
+            .get_value_cf(
+                CF_DEFAULT,
+                make_key(user_key_expire_vec.as_slice(), 100).as_slice(),
+            )
             .unwrap();
         let entry90 = raw_engine
-            .get_value_cf(CF_DEFAULT, make_key(user_key, 90).as_slice())
+            .get_value_cf(
+                CF_DEFAULT,
+                make_key(user_key_expire_vec.as_slice(), 90).as_slice(),
+            )
             .unwrap();
 
         // If ts(100) > safepoint(80), it's need to be retained.
@@ -468,6 +482,7 @@ pub mod tests {
             .unwrap();
         let raw_engine = engine.get_rocksdb();
         let mut gc_runner = TestGcRunner::new(0);
+        gc_runner.keyspace_level_gc_service = make_keyspace_level_gc_service();
         let mut gc_and_check = |expect_tasks: bool, prefix: &[u8]| {
             gc_runner.safe_point(500).gc_raw(&raw_engine);
 
@@ -487,20 +502,31 @@ pub mod tests {
             }
             assert!(!expect_tasks, "no GC task is expected");
         };
-        let user_key_del = b"r\0aaaaaaaaaaa";
-        let user_key_not_del = b"r\0zzzzzzzzzzz";
+        let user_key_del = b"user_key_del";
+        let user_key_del_vec = make_keyspace_user_key(
+            KeyMode::Raw,
+            TEST_GLOBAL_GC_KEYSPACE_ID,
+            user_key_del.to_vec(),
+        );
+
+        let user_key_not_del = b"user_key_not_del";
+        let user_key_not_del_vec = make_keyspace_user_key(
+            KeyMode::Raw,
+            TEST_GLOBAL_GC_KEYSPACE_ID,
+            user_key_del_vec.to_vec(),
+        );
 
         // If it's deleted, it will call async scheduler GcTask.
         let test_raws = vec![
-            (user_key_not_del, 630, false),
-            (user_key_not_del, 620, false),
-            (user_key_not_del, 610, false),
-            (user_key_not_del, 430, false),
-            (user_key_not_del, 420, false),
-            (user_key_not_del, 410, false),
-            (user_key_del, 9, true),
-            (user_key_del, 5, false),
-            (user_key_del, 1, false),
+            (user_key_not_del_vec.as_slice(), 630, false),
+            (user_key_not_del_vec.as_slice(), 620, false),
+            (user_key_not_del_vec.as_slice(), 610, false),
+            (user_key_not_del_vec.as_slice(), 430, false),
+            (user_key_not_del_vec.as_slice(), 420, false),
+            (user_key_not_del_vec.as_slice(), 410, false),
+            (user_key_del_vec.as_slice(), 9, true),
+            (user_key_del_vec.as_slice(), 5, false),
+            (user_key_del_vec.as_slice(), 1, false),
         ];
 
         let modifies = test_raws
@@ -549,13 +575,18 @@ pub mod tests {
             )
             .unwrap();
 
-        let user_key_expire = b"r\0bbbbbbbbbbb";
+        let user_key_expire = b"user_key_expire";
+        let user_key_expire_vec = make_keyspace_user_key(
+            KeyMode::Raw,
+            TEST_GLOBAL_GC_KEYSPACE_ID,
+            user_key_expire.to_vec(),
+        );
 
         // If it's expired, it will call async scheduler GcTask.
         let test_expired_raws = vec![
-            (user_key_expire, 9, false),
-            (user_key_expire, 5, false),
-            (user_key_expire, 1, false),
+            (user_key_expire_vec.as_slice(), 9, false),
+            (user_key_expire_vec.as_slice(), 5, false),
+            (user_key_expire_vec.as_slice(), 1, false),
         ];
 
         let modifies: Vec<Modify> = test_expired_raws
@@ -577,7 +608,7 @@ pub mod tests {
 
         engine.write(&ctx, batch).unwrap();
 
-        let check_key_expire = make_key(user_key_expire, 1);
+        let check_key_expire = make_key(user_key_expire_vec.as_slice(), 1);
         let (prefix_expired, _commit_ts) = ApiV2::split_ts(check_key_expire.as_slice()).unwrap();
         gc_and_check(true, prefix_expired);
     }

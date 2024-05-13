@@ -1,20 +1,17 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    collections::HashMap,
     sync::{atomic::AtomicU64, mpsc, Arc},
     thread,
     time::Duration,
 };
 
-use api_version::{ApiV2, KvFormat, RawValue};
-use dashmap::DashMap;
+use api_version::{ApiV2, KeyMode, KvFormat, RawValue};
 use engine_rocks::{raw::FlushOptions, util::get_cf_handle, RocksEngine};
 use engine_traits::{CF_DEFAULT, CF_WRITE};
 use keys::DATA_PREFIX_KEY;
 use keyspace_meta::KeyspaceLevelGCService;
 use kvproto::{
-    keyspacepb,
     kvrpcpb::*,
     metapb::{Peer, Region},
 };
@@ -34,9 +31,11 @@ use tikv::{
             GC_COMPACTION_FILTER_MVCC_DELETION_MET, GC_COMPACTION_FILTER_PERFORM,
             GC_COMPACTION_FILTER_SKIP,
         },
+        make_combined_key, make_keypsace_txnkv_mvcc_key_no_ts, make_keyspace_level_gc_service,
+        make_keyspace_user_key,
         rawkv_compaction_filter::make_key,
         AutoGcConfig, GcConfig, GcWorker, MockSafePointProvider, PrefixedEngine, TestGcRunner,
-        STAT_RAW_KEYMODE, STAT_TXN_KEYMODE,
+        STAT_RAW_KEYMODE, STAT_TXN_KEYMODE, TEST_GLOBAL_GC_KEYSPACE_ID,
     },
     storage::{
         kv::{Modify, TestEngineBuilder, WriteData},
@@ -86,26 +85,14 @@ fn test_txn_create_compaction_filter() {
     GC_COMPACTION_FILTER_SKIP.reset();
 }
 
-fn make_keypsace_txnkv_key(keyspace_id: u32, user_key: Vec<u8>) -> Vec<u8> {
-    let mut combined_vec = Vec::from(DATA_PREFIX_KEY);
-    let keyspace_txnkv_prefix: Vec<u8> = ApiV2::get_keyspace_id_to_txnkv_prefix(keyspace_id);
-    combined_vec.extend_from_slice(&keyspace_txnkv_prefix);
-    combined_vec.extend_from_slice(&user_key);
-    combined_vec
-}
-
-fn make_combined_key(mut a: Vec<u8>, b: Vec<u8>) -> Vec<u8> {
-    a.extend_from_slice(&b);
-    a
-}
-
 #[test]
 fn test_txn_mvcc_filtered_v2() {
     let combined_vec = Vec::from(DATA_PREFIX_KEY);
     let user_key = b"key";
+    // b"zkey"
     let api_v1_mvcc_key = make_combined_key(combined_vec, user_key.to_vec());
     test_txn_mvcc_filtered(None, api_v1_mvcc_key);
-    let keyspace_txnkv_mvcc_key = make_keypsace_txnkv_key(1, user_key.to_vec());
+    let keyspace_txnkv_mvcc_key = make_keypsace_txnkv_mvcc_key_no_ts(1, user_key.to_vec());
     test_txn_mvcc_filtered(Some(1), keyspace_txnkv_mvcc_key);
 }
 
@@ -162,61 +149,6 @@ fn test_txn_mvcc_filtered(keyspace_id: Option<u32>, key: Vec<u8>) {
 
     MVCC_VERSIONS_HISTOGRAM.reset();
     GC_COMPACTION_FILTERED.reset();
-}
-
-// make_keyspace_level_gc_service is used to construct the required keyspace
-// metas, mappings, and keyspace level GC service.
-fn make_keyspace_level_gc_service() -> Arc<KeyspaceLevelGCService> {
-    let mut keyspace_config = HashMap::new();
-    keyspace_config.insert(
-        keyspace_meta::KEYSPACE_CONFIG_KEY_GC_MGMT_TYPE.to_string(),
-        keyspace_meta::GC_MGMT_TYPE_KEYSPACE_LEVEL_GC.to_string(),
-    );
-
-    // Init keyspace_1 and keyspace_2.
-    let keyspace_1_meta = keyspacepb::KeyspaceMeta {
-        id: 1,
-        name: "test_keyspace_1".to_string(),
-        state: Default::default(),
-        created_at: 0,
-        state_changed_at: 0,
-        config: keyspace_config.clone(),
-        unknown_fields: Default::default(),
-        cached_size: Default::default(),
-    };
-
-    let keyspace_2_meta = keyspacepb::KeyspaceMeta {
-        id: 2,
-        name: "test_keyspace_2".to_string(),
-        state: Default::default(),
-        created_at: 0,
-        state_changed_at: 0,
-        config: keyspace_config,
-        unknown_fields: Default::default(),
-        cached_size: Default::default(),
-    };
-
-    // Init keyspace level GC cache.
-    let keyspace_level_gc_map = DashMap::new();
-    // make data ts < props.min_ts
-    keyspace_level_gc_map.insert(1_u32, 60_u64);
-    keyspace_level_gc_map.insert(2_u32, 69_u64);
-
-    let keyspace_level_gc_map = Arc::new(keyspace_level_gc_map);
-
-    // Init the mapping from keyspace id to keyspace meta.
-    let keyspace_id_meta_map = DashMap::new();
-
-    // Make data ts < props.min_ts( props.min_ts = 70).
-    keyspace_id_meta_map.insert(keyspace_1_meta.id, keyspace_1_meta);
-    keyspace_id_meta_map.insert(keyspace_2_meta.id, keyspace_2_meta);
-
-    let keyspace_id_meta_cache = Arc::new(keyspace_id_meta_map);
-
-    Arc::new(KeyspaceLevelGCService::new(
-        Arc::clone(&keyspace_level_gc_map),
-        Arc::clone(&keyspace_id_meta_cache),
-    ))
 }
 
 #[test]
@@ -314,6 +246,12 @@ fn test_raw_mvcc_filtered() {
     let mut gc_runner = TestGcRunner::new(0);
 
     let user_key = b"r\0aaaaaaaaaaa";
+    // let user_key = b"key";
+    // let combined_vec = Vec::from(api_version::api_v2::RAW_KEY_PREFIX);
+    // let api_v1_mvcc_key = make_combined_key(combined_vec, user_key.to_vec());
+    // test_txn_mvcc_filtered(None, api_v1_mvcc_key);
+    // let keyspace_rawkv_key = make_keypsace_txnkv_mvcc_key_no_ts(1,
+    // user_key.to_vec());
 
     let test_raws = vec![
         (user_key, 100, false),
@@ -383,7 +321,7 @@ fn test_raw_gc_keys_handled() {
         GcConfig::default(),
         feature_gate,
         Arc::new(MockRegionInfoProvider::new(vec![])),
-        Arc::new(KeyspaceLevelGCService::default()),
+        make_keyspace_level_gc_service(),
     );
     gc_worker.start(store_id).unwrap();
 
@@ -406,13 +344,21 @@ fn test_raw_gc_keys_handled() {
 
     let db = engine.kv_engine().unwrap().as_inner().clone();
 
-    let user_key_del = b"r\0aaaaaaaaaaa";
+    // let user_key_del = b"r\0aaaaaaaaaaa";
 
+    let user_key = b"key";
+    // vec!['r', 0, 0, 1, 'k', 'e', 'y']
+    let keyspace_rawkv_del_key =
+        make_keyspace_user_key(KeyMode::Raw, TEST_GLOBAL_GC_KEYSPACE_ID, user_key.to_vec());
+    println!(
+        "[test-yjy]keyspace_rawkv_del_key:{:?}",
+        keyspace_rawkv_del_key
+    );
     // If it's deleted, it will call async scheduler GcTask.
     let test_raws = vec![
-        (user_key_del, 9, true),
-        (user_key_del, 5, false),
-        (user_key_del, 1, false),
+        (keyspace_rawkv_del_key.as_slice(), 9, true),
+        (keyspace_rawkv_del_key.as_slice(), 5, false),
+        (keyspace_rawkv_del_key.as_slice(), 1, false),
     ];
 
     let modifies = test_raws
