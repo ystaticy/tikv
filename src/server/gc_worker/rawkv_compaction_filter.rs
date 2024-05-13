@@ -60,7 +60,8 @@ impl CompactionFilterFactory for RawCompactionFilterFactory {
         // If there is no initialized keyspace level GC, it should also skip GC in
         // compaction filter.
         let keyspace_level_gc_service = gc_context.keyspace_level_gc_service.clone();
-        let  is_all_ks_not_init_gc_sp = keyspace_level_gc_service.is_all_keyspace_level_gc_have_not_initialized();
+        let is_all_ks_not_init_gc_sp =
+            keyspace_level_gc_service.is_all_keyspace_level_gc_have_not_initialized();
 
         if safe_point == 0 && is_all_ks_not_init_gc_sp {
             // Safe point has not been initialized yet.
@@ -195,7 +196,8 @@ impl RawCompactionFilter {
         keyspace_level_gc_service: Arc<KeyspaceLevelGCService>,
     ) -> Self {
         // Safe point must have been initialized.
-        let is_all_ks_not_init_gc_sp = keyspace_level_gc_service.is_all_keyspace_level_gc_have_not_initialized();
+        let is_all_ks_not_init_gc_sp =
+            keyspace_level_gc_service.is_all_keyspace_level_gc_have_not_initialized();
         assert!(safe_point > 0 || !is_all_ks_not_init_gc_sp);
         debug!("gc in compaction filter"; "safe_point" => safe_point);
         RawCompactionFilter {
