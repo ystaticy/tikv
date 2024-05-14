@@ -513,7 +513,7 @@ pub mod tests {
         let user_key_not_del_vec = make_keyspace_user_key(
             KeyMode::Raw,
             TEST_GLOBAL_GC_KEYSPACE_ID,
-            user_key_del_vec.to_vec(),
+            user_key_not_del.to_vec(),
         );
 
         // If it's deleted, it will call async scheduler GcTask.
@@ -553,15 +553,17 @@ pub mod tests {
 
         engine.write(&ctx, batch).unwrap();
 
-        let check_key_del = make_key(user_key_del, 1);
+        let check_key_del = make_key(user_key_del_vec.as_slice(), 1);
         let (prefix_del, _commit_ts) = ApiV2::split_ts(check_key_del.as_slice()).unwrap();
+        println!("[test-yjy]prefix_del:{:?}", prefix_del);
         gc_and_check(true, prefix_del);
 
         // Clean the engine, prepare for later tests.
         let range_start_key =
-            keys::data_key(ApiV2::encode_raw_key(user_key_del, None).as_encoded());
+            keys::data_key(ApiV2::encode_raw_key(user_key_del_vec.as_slice(), None).as_encoded());
         let range_end_key = keys::data_key(
-            ApiV2::encode_raw_key(user_key_not_del, Some(TimeStamp::new(1))).as_encoded(),
+            ApiV2::encode_raw_key(user_key_not_del_vec.as_slice(), Some(TimeStamp::new(1)))
+                .as_encoded(),
         );
         raw_engine
             .delete_ranges_cf(
@@ -610,6 +612,7 @@ pub mod tests {
 
         let check_key_expire = make_key(user_key_expire_vec.as_slice(), 1);
         let (prefix_expired, _commit_ts) = ApiV2::split_ts(check_key_expire.as_slice()).unwrap();
+        println!("[test-yjy]prefix_expired:{:?}", prefix_expired);
         gc_and_check(true, prefix_expired);
     }
 }
